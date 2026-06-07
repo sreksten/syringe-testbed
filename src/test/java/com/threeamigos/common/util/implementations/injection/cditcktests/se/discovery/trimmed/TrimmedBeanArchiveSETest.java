@@ -122,6 +122,9 @@ class TrimmedBeanArchiveSETest {
 
         @Override
         public Enumeration<URL> getResources(String name) throws IOException {
+            if (name != null && name.startsWith("META-INF/services/")) {
+                return super.getResources(name);
+            }
             return findResources(name);
         }
     }

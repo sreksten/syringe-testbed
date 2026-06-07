@@ -24,6 +24,9 @@ import java.net.InetAddress;
  */
 public class SyringeWildFlyArquillianContainer implements DeployableContainer<SyringeWildFlyConfiguration> {
 
+    private static final int MAX_DUPLICATE_DEPLOYMENT_RECOVERY_ATTEMPTS = 4;
+    private static final long DUPLICATE_DEPLOYMENT_RETRY_BASE_DELAY_MILLIS = 150L;
+
     private SyringeWildFlyConfiguration configuration;
     private ModelControllerClient client;
 
@@ -70,22 +73,8 @@ public class SyringeWildFlyArquillianContainer implements DeployableContainer<Sy
         String runtimeName = archive.getName();
 
         byte[] content = toByteArray(archive);
-        ServerDeploymentHelper helper = new ServerDeploymentHelper(client);
-        try {
-            helper.deploy(runtimeName, toArchiveStream(content));
-        } catch (Exception e) {
-            if (!isDuplicateDeploymentFailure(e)) {
-                throw new DeploymentException("Could not deploy archive " + runtimeName, e);
-            }
-            try {
-                helper.undeploy(runtimeName);
-                helper.deploy(runtimeName, toArchiveStream(content));
-            } catch (Exception redeployFailure) {
-                throw new DeploymentException(
-                        "Could not deploy archive " + runtimeName + " after removing stale deployment",
-                        redeployFailure);
-            }
-        }
+        ServerDeploymentHelper helper = createDeploymentHelper();
+        deployWithDuplicateRecovery(helper, runtimeName, content);
 
         ProtocolMetaData metaData = new ProtocolMetaData();
         // Arquillian servlet protocol resolves base URI by servlet name + context root.
@@ -102,7 +91,7 @@ public class SyringeWildFlyArquillianContainer implements DeployableContainer<Sy
     public void undeploy(Archive<?> archive) throws DeploymentException {
         ensureClient();
         String runtimeName = archive.getName();
-        ServerDeploymentHelper helper = new ServerDeploymentHelper(client);
+        ServerDeploymentHelper helper = createDeploymentHelper();
         try {
             helper.undeploy(runtimeName);
         } catch (Exception e) {
@@ -142,6 +131,62 @@ public class SyringeWildFlyArquillianContainer implements DeployableContainer<Sy
         }
     }
 
+    private void deployWithDuplicateRecovery(ServerDeploymentHelper helper, String runtimeName, byte[] content)
+            throws DeploymentException {
+        Exception lastDuplicateFailure = null;
+        Exception lastCleanupFailure = null;
+
+        for (int attempt = 0; attempt < MAX_DUPLICATE_DEPLOYMENT_RECOVERY_ATTEMPTS; attempt++) {
+            try {
+                helper.deploy(runtimeName, toArchiveStream(content));
+                return;
+            } catch (Exception deployFailure) {
+                if (!isDuplicateDeploymentFailure(deployFailure)) {
+                    throw new DeploymentException("Could not deploy archive " + runtimeName, deployFailure);
+                }
+                lastDuplicateFailure = deployFailure;
+
+                try {
+                    helper.undeploy(runtimeName);
+                    lastCleanupFailure = null;
+                } catch (Exception undeployFailure) {
+                    if (!isMissingDeploymentFailure(undeployFailure)) {
+                        lastCleanupFailure = undeployFailure;
+                    }
+                }
+
+                if (attempt + 1 < MAX_DUPLICATE_DEPLOYMENT_RECOVERY_ATTEMPTS) {
+                    pauseBeforeDuplicateRetry(attempt);
+                }
+            }
+        }
+
+        DeploymentException failure = new DeploymentException(
+                "Could not deploy archive " + runtimeName
+                        + " after " + MAX_DUPLICATE_DEPLOYMENT_RECOVERY_ATTEMPTS
+                        + " duplicate-recovery attempt(s)",
+                lastDuplicateFailure);
+        if (lastCleanupFailure != null) {
+            failure.addSuppressed(lastCleanupFailure);
+        }
+        throw failure;
+    }
+
+    ServerDeploymentHelper createDeploymentHelper() {
+        return new ServerDeploymentHelper(client);
+    }
+
+    void pauseBeforeDuplicateRetry(int attempt) throws DeploymentException {
+        long delayMillis = DUPLICATE_DEPLOYMENT_RETRY_BASE_DELAY_MILLIS * (attempt + 1L);
+        try {
+            Thread.sleep(delayMillis);
+        } catch (InterruptedException interruptedException) {
+            Thread.currentThread().interrupt();
+            throw new DeploymentException("Interrupted while waiting to retry duplicate deployment recovery",
+                    interruptedException);
+        }
+    }
+
     private static byte[] toByteArray(Archive<?> archive) {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         archive.as(ZipExporter.class).exportTo(baos);
@@ -159,6 +204,20 @@ public class SyringeWildFlyArquillianContainer implements DeployableContainer<Sy
             if (message != null
                     && message.contains("WFLYCTL0212")
                     && message.contains("Duplicate resource")
+                    && message.contains("(\"deployment\" => \"")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    static boolean isMissingDeploymentFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            String message = current.getMessage();
+            if (message != null
+                    && (message.contains("WFLYCTL0216") || message.contains("not found"))
                     && message.contains("(\"deployment\" => \"")) {
                 return true;
             }
